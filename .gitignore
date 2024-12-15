@@ -1,0 +1,7 @@
+templates
+bin
+lib
+lib64
+*.log
+pyvenv.cfg
+mqtt_config.json
