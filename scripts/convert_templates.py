@@ -47,11 +47,11 @@ class MQTTTopicCache:
         """Setup MQTT client with error handling"""
         if self.config.username and self.config.password:
             self.client.username_pw_set(self.config.username, self.config.password)
-        
+
         self.client.on_message = self._on_message
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
-        
+
         try:
             self.client.connect(self.config.broker, self.config.port, self.config.timeout)
         except Exception as e:
@@ -78,14 +78,14 @@ class MQTTTopicCache:
             self.client.loop_start()
             time.sleep(self.config.timeout)  # Wait for topics
             self.client.loop_stop()
-            
+
             if not self.topics:
                 logging.warning("No topics were collected from MQTT broker")
             else:
                 logging.info(f"Collected {len(self.topics)} topics")
-                
+
             return self.topics
-            
+
         except Exception as e:
             logging.error(f"Error fetching topics: {e}")
             raise
@@ -98,7 +98,7 @@ class MQTTTopicCache:
 def load_config() -> MQTTConfig:
     """Load MQTT configuration from file or environment"""
     config_path = os.getenv("MQTT_CONFIG", "mqtt_config.json")
-    
+
     try:
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
@@ -106,7 +106,7 @@ def load_config() -> MQTTConfig:
                 return MQTTConfig(**config_data)
     except Exception as e:
         logging.warning(f"Failed to load config file: {e}")
-    
+
     # Fall back to environment variables
     return MQTTConfig(
         broker=os.getenv("MQTT_BROKER", "localhost"),
@@ -120,16 +120,42 @@ def find_matching_devices(topic_cache, topic_search):
     """Find all devices matching the topicSearch pattern"""
     if not topic_search:
         return []
-    
-    pattern = topic_search.replace("(", "(?P<group").replace(")", ">.*?)")
-    regex = re.compile(pattern)
-    
+
+    # Replace the problematic group naming with simple numbered groups
+    pattern = topic_search
+    group_count = 1
+
+    # Keep track of positions we've already processed
+    processed_positions = set()
+    pos = 0
+
+    while True:
+        pos = pattern.find('(', pos)
+        if pos == -1 or pos in processed_positions:
+            break
+
+        pattern = f"{pattern[:pos]}(?P<g{group_count}>{pattern[pos+1:]}"
+        processed_positions.add(pos)
+        pos += 1
+        group_count += 1
+
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        logging.warning(f"Invalid regex pattern '{pattern}': {e}")
+        return []
+
     matches = []
     for topic in topic_cache.topics:
         match = regex.match(topic)
         if match:
-            matches.append(match.groupdict())
-    
+            # Convert the group names to the expected format
+            groups = match.groupdict()
+            renamed_groups = {}
+            for i, (_, value) in enumerate(groups.items(), 1):
+                renamed_groups[str(i)] = value
+            matches.append(renamed_groups)
+
     return matches
 
 def substitute_topic(topic_template, matches):
@@ -154,18 +180,18 @@ def get_value_template(link_type, service_type, char_type):
 def convert_characteristic_to_ha(device_matches, service, characteristic, topic_cache):
     """Convert a characteristic to HA MQTT discovery format"""
     configs = []
-    
+
     for match in device_matches:
         char_type = characteristic.get("type")
         link = characteristic.get("link", {})
         link_type = link.get("type")
-        
+
         # Get topic patterns
         topic_get = substitute_topic(link.get("topicGet", ""), match)
         topic_set = substitute_topic(link.get("topicSet", ""), match) if link.get("topicSet") else None
-        
-        device_id = match.get("group1", "unknown")
-        
+
+        device_id = match.get("g1", "unknown")
+
         # Base configuration
         config = {
             "name": f"{service.get('name', char_type)} {device_id}",
@@ -182,7 +208,7 @@ def convert_characteristic_to_ha(device_matches, service, characteristic, topic_
         # Add value template
         service_type = service.get("type")
         config["value_template"] = get_value_template(link_type, service_type, char_type)
-        
+
         # Handle command value conversion
         if topic_set:
             config["command_topic"] = topic_set
@@ -191,34 +217,34 @@ def convert_characteristic_to_ha(device_matches, service, characteristic, topic_
 
         # Map service types to HA components and classes
         component = "sensor"  # default
-        
+
         if service_type == "TemperatureSensor":
             config.update({
                 "device_class": "temperature",
                 "unit_of_measurement": "°C"
             })
             component = "sensor"
-            
+
         elif service_type == "HumiditySensor":
             config.update({
                 "device_class": "humidity",
                 "unit_of_measurement": "%"
             })
             component = "sensor"
-            
+
         elif service_type == "LightSensor":
             config.update({
                 "device_class": "illuminance",
                 "unit_of_measurement": "lx"
             })
             component = "sensor"
-            
+
         elif service_type == "AirQualitySensor":
             config.update({
                 "device_class": "aqi"
             })
             component = "sensor"
-            
+
         elif service_type == "LeakSensor":
             config.update({
                 "device_class": "moisture",
@@ -226,14 +252,14 @@ def convert_characteristic_to_ha(device_matches, service, characteristic, topic_
                 "payload_off": "0"
             })
             component = "binary_sensor"
-            
+
         elif service_type == "Switch":
             config.update({
                 "payload_on": "1",
                 "payload_off": "0"
             })
             component = "switch"
-            
+
         elif service_type == "ContactSensor":
             config.update({
                 "device_class": "opening",
@@ -241,7 +267,7 @@ def convert_characteristic_to_ha(device_matches, service, characteristic, topic_
                 "payload_off": "0"
             })
             component = "binary_sensor"
-            
+
         elif service_type == "Lightbulb":
             if char_type == "Brightness":
                 config.update({
@@ -257,7 +283,7 @@ def convert_characteristic_to_ha(device_matches, service, characteristic, topic_
                     "payload_off": "0"
                 })
                 component = "light"
-                
+
         elif service_type == "Valve":
             config.update({
                 "payload_on": "1",
@@ -265,7 +291,7 @@ def convert_characteristic_to_ha(device_matches, service, characteristic, topic_
                 "device_class": "valve"
             })
             component = "switch"
-            
+
         elif service_type == "C_PulseMeter" or char_type == "C_PulseCount":
             config.update({
                 "device_class": "energy",
@@ -274,7 +300,7 @@ def convert_characteristic_to_ha(device_matches, service, characteristic, topic_
             component = "sensor"
 
         configs.append((component, config))
-    
+
     return configs
 
 def load_template(file_path: Path) -> List[Dict]:
@@ -282,14 +308,14 @@ def load_template(file_path: Path) -> List[Dict]:
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             template = json.load(f)
-            
+
         # Ensure template is a list
         if not isinstance(template, list):
             template = [template]
-            
+
         logging.info(f"Loaded template from {file_path}: {len(template)} devices")
         return template
-        
+
     except json.JSONDecodeError as e:
         logging.error(f"Invalid JSON in template {file_path}: {e}")
         raise
@@ -301,54 +327,54 @@ def process_template(template_file: Path, topic_cache: MQTTTopicCache) -> List[D
     """Process a single template file and return HA configurations"""
     template = load_template(template_file)
     configs = []
-    
+
     for device in template:
         try:
             device_id = device.get("model", "unknown").lower().replace(" ", "-")
             manufacturer = device.get("manufacturer")
-            
+
             for service in device.get("services", []):
                 for characteristic in service.get("characteristics", []):
                     try:
                         topic_search = characteristic.get("link", {}).get("topicSearch")
                         device_matches = find_matching_devices(topic_cache, topic_search)
-                        
+
                         if device_matches:
                             service_configs = convert_characteristic_to_ha(
-                                device_matches, 
-                                {**service, "manufacturer": manufacturer}, 
-                                characteristic, 
+                                device_matches,
+                                {**service, "manufacturer": manufacturer},
+                                characteristic,
                                 topic_cache
                             )
                             configs.extend(service_configs)
                         else:
                             logging.warning(f"No matching devices found for {topic_search}")
-                            
+
                     except Exception as e:
                         logging.error(f"Error processing characteristic {characteristic}: {e}")
                         continue
-                        
+
         except Exception as e:
             logging.error(f"Error processing device {device.get('model', 'unknown')}: {e}")
             continue
-    
+
     return configs
 
 def main():
     try:
         # Load configuration
         mqtt_config = load_config()
-        
+
         # Initialize MQTT topic cache
         topic_cache = MQTTTopicCache(mqtt_config)
         topic_cache.fetch_topics()
-        
+
         all_configs = []
-        
+
         # Process all template files
         template_files = list(Path(TEMPLATES_DIR).glob("**/*.json"))
         logging.info(f"Found {len(template_files)} template files")
-        
+
         for template_file in template_files:
             try:
                 logging.info(f"Processing template: {template_file}")
@@ -357,7 +383,7 @@ def main():
                 logging.info(f"Successfully processed {len(configs)} configurations from {template_file}")
             except Exception as e:
                 logging.error(f"Error processing template {template_file}: {e}")
-        
+
         # Write output file
         try:
             with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
@@ -366,7 +392,7 @@ def main():
         except Exception as e:
             logging.error(f"Error writing output file: {e}")
             raise
-            
+
     except Exception as e:
         logging.error(f"Fatal error: {e}")
         sys.exit(1)
