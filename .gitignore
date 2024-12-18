@@ -4,3 +4,5 @@ lib64
 *.log
 pyvenv.cfg
 mqtt_config.json
+converted_configs.yml
+converted_configs.json

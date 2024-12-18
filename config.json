@@ -1,0 +1,7 @@
+{
+  "mqtt": {
+    "host": "192.168.1.149",
+    "port": 1883
+  },
+  "discovery_prefix": "homeassistant"
+}
