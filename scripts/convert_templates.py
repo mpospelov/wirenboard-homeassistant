@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 
 # Configuration
-TEMPLATES_DIR = "./templates"
+TEMPLATES_DIRS = ["./templates", "./custom_templates"]
 OUTPUT_FILE = "converted_configs.yml"
 BASE_TOPIC = "homeassistant"
 
@@ -187,7 +187,7 @@ def get_value_template(link_type, service_type, char_type):
         return "{{ value | int }}"
     return "{{ value }}"
 
-def convert_characteristic_to_ha(device_matches, service, characteristic, topic_cache):
+def convert_characteristic_to_ha(device_matches, service, characteristic, topic_cache, seen_unique_ids):
     """Convert a characteristic to HA MQTT discovery format"""
     configs = []
     mqtt_config = load_config()  # Get config for discovery prefix
@@ -196,38 +196,66 @@ def convert_characteristic_to_ha(device_matches, service, characteristic, topic_
         char_type = characteristic.get("type")
         link = characteristic.get("link", {})
         link_type = link.get("type")
+        service_type = service.get("type")
 
         # Get topic patterns
         topic_get = substitute_topic(link.get("topicGet", ""), match)
         topic_set = substitute_topic(link.get("topicSet", ""), match) if link.get("topicSet") else None
 
         device_id = match.get("group1", "unknown")
+        # Extract model name and include it in device_id
+        model = device_id.split('_')[0] if device_id and '_' in device_id else device_id
+
+        # Include model prefix in device_id
+        if "ecodim" in model.lower():
+            device_id = f"ecodim_dali_{device_id}"
+        elif "wb-mr" in model.lower():
+            device_id = f"wb_modbus_relay_{device_id}"
+        elif "wb-ms" in model.lower():
+            device_id = f"wb_modbus_sensor_{device_id}"
+
+        # Include group2 in device identifiers if available
+        if match.get('group2'):
+            device_id = f"{device_id}_{match.get('group2')}"
+
+        # Generate unique_id
+        unique_id = f"wb_{device_id}_{char_type}"
+
+        # Skip if we've seen this unique_id before
+        if unique_id in seen_unique_ids:
+            continue
+
+        seen_unique_ids.add(unique_id)
 
         # Base configuration
         config = {
-            "name": f"{service.get('name', char_type)} {device_id}",
-            "unique_id": f"wb_{device_id}_{char_type}",
+            "name": device_id,  # Use the prefixed device_id as the name
+            "unique_id": unique_id,
             "state_topic": topic_get,
             "device": {
                 "identifiers": [f"wb_{device_id}"],
                 "name": device_id,
                 "manufacturer": service.get("manufacturer", "Wiren Board"),
-                "model": service.get("model")
+                "model": model
             },
-            "retain": True,
-            "qos": 0,
-            "optimistic": False
+            "qos": 0
         }
 
+        # Only add retain and optimistic for non-sensor components
+        if service_type not in ["TemperatureSensor", "HumiditySensor", "LightSensor",
+                              "AirQualitySensor", "LeakSensor", "ContactSensor", "BatteryService"]:
+            config.update({
+                "retain": True,
+                "optimistic": False
+            })
+
         # Add value template
-        service_type = service.get("type")
-        config["value_template"] = get_value_template(link_type, service_type, char_type)
+        if service_type != "Lightbulb":  # Don't add value_template for lights
+            config["value_template"] = get_value_template(link_type, service_type, char_type)
 
         # Handle command value conversion
         if topic_set:
             config["command_topic"] = topic_set
-            if service_type == "Lightbulb" and char_type == "Brightness":
-                config["command_template"] = "{{ (value | int * 10000 / 255) | round | int }}"
 
         # Map service types to HA components and classes
         component = "sensor"  # default
@@ -287,27 +315,30 @@ def convert_characteristic_to_ha(device_matches, service, characteristic, topic_
             component = "binary_sensor"
 
         elif service_type == "Lightbulb":
-            if char_type == "Brightness":
-                # For brightness, we need both state and command topics
-                brightness_base = topic_get.replace("/controls/", "/controls/Brightness ")
+            # Base light configuration
+            config.update({
+                "payload_on": "1",
+                "payload_off": "0",
+                "brightness_scale": 100,
+                "brightness_state_topic": f"{topic_get} Brightness",
+                "brightness_command_topic": f"{topic_get} Brightness/on"
+            })
+
+            # Add color temperature support if it's a ColorTemperature characteristic
+            if char_type == "ColorTemperature":
                 config.update({
-                    "brightness_state_topic": brightness_base,
-                    "brightness_command_topic": f"{brightness_base}/on",
-                    "brightness_scale": 100,
-                    "payload_on": "1",
-                    "payload_off": "0"
+                    "color_temp_state_topic": topic_get,
+                    "color_temp_command_topic": topic_set if topic_set else f"{topic_get}/on",
+                    "min_mireds": 153,  # 6500K
+                    "max_mireds": 370,  # 2700K
+                    "color_temp_value_template": "{{ value | int }}"
                 })
-                component = "light"
-            elif char_type == "On":
-                config.update({
-                    "payload_on": "1",
-                    "payload_off": "0",
-                    # Add brightness topics for the main light control
-                    "brightness_state_topic": f"{topic_get} Brightness",
-                    "brightness_command_topic": f"{topic_get} Brightness/on",
-                    "brightness_scale": 100
-                })
-                component = "light"
+
+            component = "light"
+
+            # Only add the configuration if it's the main "On" characteristic
+            if char_type == "On":
+                configs.append((component, config))
 
         elif service_type == "Valve":
             config.update({
@@ -349,7 +380,7 @@ def load_template(file_path: Path) -> List[Dict]:
         logging.error(f"Error loading template {file_path}: {e}")
         raise
 
-def process_template(template_file: Path, topic_cache: MQTTTopicCache) -> List[tuple]:
+def process_template(template_file: Path, topic_cache: MQTTTopicCache, seen_unique_ids: set) -> List[tuple]:
     """Process a single template file and return HA configurations"""
     template = load_template(template_file)
     configs = []
@@ -370,7 +401,8 @@ def process_template(template_file: Path, topic_cache: MQTTTopicCache) -> List[t
                                 device_matches,
                                 {**service, "manufacturer": manufacturer},
                                 characteristic,
-                                topic_cache
+                                topic_cache,
+                                seen_unique_ids
                             )
                             configs.extend(service_configs)
                         else:
@@ -397,17 +429,27 @@ def main():
 
         all_configs = defaultdict(list)
 
-        # Process all template files
-        template_files = list(Path(TEMPLATES_DIR).glob("**/*.json"))
+        # Process all template files from all directories
+        template_files = []
+        for template_dir in TEMPLATES_DIRS:
+            template_dir_path = Path(template_dir)
+            if template_dir_path.exists():
+                template_files.extend(list(template_dir_path.glob("**/*.json")))
+            else:
+                logging.warning(f"Template directory {template_dir} does not exist")
+
         logging.info(f"Found {len(template_files)} template files")
 
+        seen_unique_ids = set()
         for template_file in template_files:
             try:
                 logging.info(f"Processing template: {template_file}")
-                configs = process_template(template_file, topic_cache)
+                configs = process_template(template_file, topic_cache, seen_unique_ids)
                 # Group configs by component type
                 for component, config in configs:
-                    all_configs[component].append(config)
+                    # Create a deep copy to prevent YAML references
+                    config_copy = json.loads(json.dumps(config))
+                    all_configs[component].append(config_copy)
                 logging.info(f"Successfully processed configurations from {template_file}")
             except Exception as e:
                 logging.error(f"Error processing template {template_file}: {e}")
@@ -415,7 +457,7 @@ def main():
         # Write output file
         try:
             with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-                yaml.dump(dict(all_configs), f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                yaml.dump(dict(all_configs), f, allow_unicode=True, sort_keys=False, default_flow_style=False, default_style='')
             logging.info(f"Successfully wrote configurations to {OUTPUT_FILE}")
         except Exception as e:
             logging.error(f"Error writing output file: {e}")
